@@ -13,7 +13,7 @@ import (
 	"github.com/google/go-cmp/cmp/internal/function"
 )
 
-// Option configures for specific behavior of [Equal] and [Diff]. In particular,
+// Option configures for specific behavior of [Equal], [Diff], and [Compare]. In particular,
 // the fundamental Option functions ([Ignore], [Transformer], and [Comparer]),
 // configure how equality is determined.
 //
