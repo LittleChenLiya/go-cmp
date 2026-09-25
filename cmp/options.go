@@ -204,6 +204,53 @@ func (ignore) filter(_ *state, _ reflect.Type, _, _ reflect.Value) applicableOpt
 func (ignore) apply(s *state, _, _ reflect.Value)                                   { s.report(true, reportByIgnore) }
 func (ignore) String() string                                                       { return "Ignore()" }
 
+// AliasTopology returns an [Option] that requires the two compared values to
+// have the same pointer sharing topology (also known as aliasing structure).
+//
+// By default, [Equal] compares values only: two pointers are equal if the
+// values they point to are recursively equal, regardless of whether the
+// pointers themselves identify the same object. With this option, [Equal]
+// additionally maintains a bijective (one-to-one) mapping between the
+// pointer identities encountered on both sides. Whenever a non-nil pointer
+// is compared, its identity is recorded; if either pointer of the pair has
+// been seen before, both must have been seen together as a pair, otherwise
+// the values are reported as unequal at that path. Thus, if two fields on
+// one side point to the same object, the corresponding fields on the other
+// side must also point to a single (shared) object, and vice versa.
+//
+// Cycles terminate by paired identity lookup: when a previously recorded
+// pair of pointers is encountered again, the values are considered equal at
+// that point without re-comparing their contents, so isomorphic cyclic
+// graphs (e.g., self-referential linked lists) compare equal. Pointer
+// addresses are only ever compared for identity; their numeric values are
+// never treated as content.
+//
+// The mapping is global to a single call of [Equal] or [Diff] and is
+// re-checked across different branches of the value tree. Only pointers
+// (reflect.Ptr) participate in the mapping; the sharing of slice backing
+// arrays and the internal addresses of maps are out of scope and retain
+// their default comparison behavior.
+//
+// Boundary with other options:
+//   - Paths skipped by [Ignore] never establish a mapping.
+//   - Sub-trees taken over by a [Comparer] are compared entirely by that
+//     function; no mappings are established for pointers within them.
+//   - Values produced by a [Transformer] are compared as a fresh sub-tree;
+//     mappings established within the transformed output do not relate to
+//     pointers outside of it.
+//
+// This option is global and cannot be combined with [FilterPath] or
+// [FilterValues]. The default behavior of [Equal] and [Diff] is unchanged
+// unless this option is provided.
+func AliasTopology() Option { return aliasTopology{} }
+
+type aliasTopology struct{}
+
+func (aliasTopology) filter(_ *state, _ reflect.Type, _, _ reflect.Value) applicableOption {
+	panic("not implemented")
+}
+func (aliasTopology) String() string { return "AliasTopology()" }
+
 // validator is a sentinel Option type to indicate that some options could not
 // be evaluated due to unexported fields, missing slice elements, or
 // missing map entries. Both values are validator only for unexported fields.
@@ -473,6 +520,13 @@ func (r Result) ByCycle() bool {
 	return r.flags&reportByCycle != 0
 }
 
+// ByAlias reports whether equality was determined by the pointer identity
+// mapping maintained by the [AliasTopology] option rather than by
+// recursively comparing the pointed-at values.
+func (r Result) ByAlias() bool {
+	return r.flags&reportByAlias != 0
+}
+
 type resultFlags uint
 
 const (
@@ -484,6 +538,7 @@ const (
 	reportByMethod
 	reportByFunc
 	reportByCycle
+	reportByAlias
 )
 
 // Reporter is an [Option] that can be passed to [Equal]. When [Equal] traverses

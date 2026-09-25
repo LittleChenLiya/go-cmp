@@ -24,6 +24,16 @@ The primary features of `cmp` are:
   by using an `Ignore` option (see `cmpopts.IgnoreUnexported`) or explicitly
   compared using the `AllowUnexported` option.
 
+* By default, only values are compared; whether two pointers identify the
+  same object is irrelevant. The `AliasTopology` option additionally requires
+  both values to share the same pointer aliasing structure: if two fields on
+  one side point to the same object, the corresponding fields on the other
+  side must point to a single shared object as well (and vice versa).
+  Cycles terminate through paired identity lookup, so isomorphic cyclic
+  graphs compare equal. Paths skipped by `Ignore` never establish an
+  identity mapping, and sub-trees taken over by a `Comparer` or
+  `Transformer` are handled by those options as usual.
+
 See the [documentation][godev] for more information.
 
 This is not an official Google product.

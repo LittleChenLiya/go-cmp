@@ -92,6 +92,11 @@ import (
 // is checked to detect whether the address has already been visited.
 // If there is a cycle, then the pointed at values are considered equal
 // only if both addresses were previously visited in the same path step.
+//
+// By default, only the values are compared; whether two pointers identify
+// the same object is irrelevant. The [AliasTopology] option may be provided
+// to additionally require that both values share the same pointer aliasing
+// structure.
 func Equal(x, y any, opts ...Option) bool {
 	s := newState(opts)
 	s.compareAny(rootStep(x, y))
@@ -123,7 +128,11 @@ func Diff(x, y any, opts ...Option) string {
 		if s.result.Equal() {
 			return ""
 		}
-		s.result = diff.Result{} // Reset results
+		s.result = diff.Result{}  // Reset results
+		s.aliases = pointerPath{} // Reset the alias identity mapping
+		if s.aliasTopo {
+			s.aliases.Init()
+		}
 	}
 
 	r := new(defaultReporter)
@@ -172,6 +181,14 @@ type state struct {
 	curPtrs   pointerPath // The current set of visited pointers
 	reporters []reporter  // Optional reporters
 
+	// aliasTopo reports whether the AliasTopology option is in effect.
+	aliasTopo bool
+	// aliases is the global bijective mapping between x and y pointer
+	// identities maintained when aliasTopo is set. Unlike curPtrs,
+	// entries are never popped; the mapping persists for the entire
+	// comparison and is re-checked across different branches.
+	aliases pointerPath
+
 	// recChecker checks for infinite cycles applying the same set of
 	// transformers upon the output of itself.
 	recChecker recChecker
@@ -212,6 +229,9 @@ func (s *state) processOption(opt Option) {
 		s.exporters = append(s.exporters, opt)
 	case reporter:
 		s.reporters = append(s.reporters, opt)
+	case aliasTopology:
+		s.aliasTopo = true
+		s.aliases.Init()
 	default:
 		panic(fmt.Sprintf("unknown option %T", opt))
 	}
@@ -229,9 +249,17 @@ func (s *state) statelessCompare(step PathStep) diff.Result {
 	oldResult, oldReporters := s.result, s.reporters
 	s.result = diff.Result{} // Reset result
 	s.reporters = nil        // Remove reporters to avoid spurious printouts
+	oldAliases := s.aliases
+	if s.aliasTopo {
+		// Isolate the identity mapping so that speculative comparisons
+		// (e.g., slice difference computation) neither observe nor
+		// pollute the mapping of the real traversal.
+		s.aliases = pointerPath{}
+		s.aliases.Init()
+	}
 	s.compareAny(step)
 	res := s.result
-	s.result, s.reporters = oldResult, oldReporters
+	s.result, s.reporters, s.aliases = oldResult, oldReporters, oldAliases
 	return res
 }
 
@@ -552,6 +580,23 @@ func (s *state) compareMap(t reflect.Type, vx, vy reflect.Value) {
 func (s *state) comparePtr(t reflect.Type, vx, vy reflect.Value) {
 	if vx.IsNil() || vy.IsNil() {
 		s.report(vx.IsNil() && vy.IsNil(), 0)
+		return
+	}
+
+	if s.aliasTopo {
+		// Maintain a global, bijective mapping between pointer identities.
+		// If either pointer was seen before, both must have been seen
+		// together as a pair; otherwise the sharing topology differs.
+		// A previously recorded pair is equal by identity without
+		// re-comparing contents, which also terminates cycles.
+		// The mapping is never popped so that it is re-checked across
+		// different branches of the value tree.
+		if eq, visited := s.aliases.Push(vx, vy); visited {
+			s.report(eq, reportByAlias)
+			return
+		}
+		vx, vy = vx.Elem(), vy.Elem()
+		s.compareAny(Indirect{&indirect{pathStep{t.Elem(), vx, vy}}})
 		return
 	}
 
