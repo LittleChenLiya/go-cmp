@@ -172,6 +172,10 @@ type state struct {
 	curPtrs   pointerPath // The current set of visited pointers
 	reporters []reporter  // Optional reporters
 
+	// aliasTracker, if non-nil, tracks the bijective mapping between
+	// pointer identities in x and y (see the AliasTopology option).
+	aliasTracker *aliasTracker
+
 	// recChecker checks for infinite cycles applying the same set of
 	// transformers upon the output of itself.
 	recChecker recChecker
@@ -200,6 +204,10 @@ func (s *state) processOption(opt Option) {
 		for _, o := range opt {
 			s.processOption(o)
 		}
+	case aliasTopology:
+		if s.aliasTracker == nil {
+			s.aliasTracker = newAliasTracker()
+		}
 	case coreOption:
 		type filtered interface {
 			isFiltered() bool
@@ -225,6 +233,18 @@ func (s *state) statelessCompare(step PathStep) diff.Result {
 	// compareX methods should properly push and pop from them.
 	// It is an implementation bug if the contents of the paths differ from
 	// when calling this function to when returning from it.
+
+	if s.aliasTracker != nil {
+		// Mappings established by a speculative comparison must not leak
+		// into the surrounding comparison; roll them back upon completion.
+		var trail []value.Pointer
+		prevTrail := s.aliasTracker.trail
+		s.aliasTracker.trail = &trail
+		defer func() {
+			s.aliasTracker.rollback(trail)
+			s.aliasTracker.trail = prevTrail
+		}()
+	}
 
 	oldResult, oldReporters := s.result, s.reporters
 	s.result = diff.Result{} // Reset result
@@ -562,6 +582,14 @@ func (s *state) comparePtr(t reflect.Type, vx, vy reflect.Value) {
 	}
 	defer s.curPtrs.Pop(vx, vy)
 
+	// Verify that the pointer aliasing topology is consistent.
+	// An inconsistent mapping is reported as a leaf difference at the
+	// current path so that Diff marks the location that breaks sharing.
+	if s.aliasTracker != nil && !s.aliasTracker.mapPair(vx, vy) {
+		s.report(false, 0)
+		return
+	}
+
 	vx, vy = vx.Elem(), vy.Elem()
 	s.compareAny(Indirect{&indirect{pathStep{t.Elem(), vx, vy}}})
 }
@@ -668,4 +696,60 @@ func makeAddressable(v reflect.Value) reflect.Value {
 	vc := reflect.New(v.Type()).Elem()
 	vc.Set(v)
 	return vc
+}
+
+// aliasTracker tracks the bidirectional mapping between pointer identities
+// in the x and y value graphs. It is only used when the AliasTopology
+// option is provided.
+//
+// The mapping is established the first time a pair of pointers is compared
+// and is re-verified whenever either pointer is encountered again, possibly
+// on a different branch of the value graph. Unlike curPtrs, entries are
+// never popped, so aliasing relationships must be consistent across the
+// entire comparison rather than only along the current path.
+type aliasTracker struct {
+	// mx is keyed by x pointers, where the value is the associated y pointer.
+	mx map[value.Pointer]value.Pointer
+	// my is keyed by y pointers, where the value is the associated x pointer.
+	my map[value.Pointer]value.Pointer
+
+	// trail, when non-nil, records pointers newly added to mx so that
+	// speculative comparisons (see statelessCompare) can be rolled back.
+	trail *[]value.Pointer
+}
+
+func newAliasTracker() *aliasTracker {
+	return &aliasTracker{
+		mx: make(map[value.Pointer]value.Pointer),
+		my: make(map[value.Pointer]value.Pointer),
+	}
+}
+
+// mapPair records or verifies the mapping between the pointers vx and vy,
+// which must both be non-nil reflect.Ptr values. It reports false if either
+// pointer was previously mapped to a different pointer on the other side,
+// indicating that the aliasing topology of the two values differs.
+func (t *aliasTracker) mapPair(vx, vy reflect.Value) bool {
+	px := value.PointerOf(vx)
+	py := value.PointerOf(vy)
+	oy, okX := t.mx[px]
+	ox, okY := t.my[py]
+	if okX || okY {
+		return okX && okY && oy == py && ox == px
+	}
+	t.mx[px] = py
+	t.my[py] = px
+	if t.trail != nil {
+		*t.trail = append(*t.trail, px)
+	}
+	return true
+}
+
+// rollback removes all mappings recorded in the given trail.
+func (t *aliasTracker) rollback(trail []value.Pointer) {
+	for _, px := range trail {
+		py := t.mx[px]
+		delete(t.mx, px)
+		delete(t.my, py)
+	}
 }

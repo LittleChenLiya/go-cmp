@@ -378,3 +378,26 @@ var t fakeT
 type fakeT struct{}
 
 func (t fakeT) Errorf(format string, args ...any) { fmt.Printf(format+"\n", args...) }
+
+// Use AliasTopology to also require that the pointer aliasing topology of
+// the two values matches: if two locations in one value hold the same
+// pointer, the corresponding locations in the other value must hold the
+// same pointer, and vice versa.
+func ExampleAliasTopology() {
+	type Pair struct {
+		A *int
+		B *int
+	}
+
+	shared := 1
+	x := Pair{A: &shared, B: &shared} // A and B alias the same object
+	y1, y2 := 1, 1
+	y := Pair{A: &y1, B: &y2} // A and B are independent objects
+
+	fmt.Println("default:", cmp.Equal(x, y))
+	fmt.Println("alias topology:", cmp.Equal(x, y, cmp.AliasTopology()))
+
+	// Output:
+	// default: true
+	// alias topology: false
+}

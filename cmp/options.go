@@ -388,6 +388,44 @@ func (cm comparer) String() string {
 	return fmt.Sprintf("Comparer(%s)", function.NameOf(cm.fnc))
 }
 
+// AliasTopology returns an [Option] that additionally requires the pointer
+// aliasing topology of the two values to be identical.
+//
+// By default, [Equal] compares values by their contents: two pointers are
+// equal if the values they point to are equal, regardless of whether
+// multiple pointers alias the same object. With this option, pointer
+// identity must also correspond one-to-one between x and y: whenever two
+// locations in x hold the same pointer, the corresponding locations in y
+// must hold the same pointer, and vice versa. The mapping between pointer
+// identities is established the first time a pair of pointers is compared
+// and is re-verified whenever either pointer is encountered again, even on
+// a different branch of the value graph. Cycles terminate when a pair of
+// pointers is encountered that was already visited together; pointer
+// addresses are only used as identities and their values are never compared
+// as content.
+//
+// The topology only tracks pointers ([reflect.Ptr]). The backing arrays of
+// slices and the internal addresses of maps are not part of the topology.
+// Paths skipped by an [Ignore] option establish no mapping. Subtrees taken
+// over by a [Comparer] or [Transformer] option follow the existing rules:
+// a [Comparer] compares the subtree as a leaf and establishes no mappings
+// within it, while the output of a [Transformer] is compared normally and
+// only establishes mappings for pointers appearing in the transformed
+// output. Similarly, types with an Equal method are compared as leaves.
+//
+// This option does not change the behavior of [Equal] or [Diff] unless
+// explicitly provided.
+func AliasTopology() Option { return aliasTopology{} }
+
+// aliasTopology is a sentinel Option that enables the tracking of pointer
+// aliasing topology for the entire comparison. It is not a coreOption and
+// cannot be combined with filters; state.processOption handles it directly.
+type aliasTopology struct{}
+
+func (aliasTopology) filter(_ *state, _ reflect.Type, _, _ reflect.Value) applicableOption {
+	panic("not implemented")
+}
+
 // Exporter returns an [Option] that specifies whether [Equal] is allowed to
 // introspect into the unexported fields of certain struct types.
 //
