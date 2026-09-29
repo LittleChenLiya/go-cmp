@@ -172,6 +172,23 @@ type state struct {
 	curPtrs   pointerPath // The current set of visited pointers
 	reporters []reporter  // Optional reporters
 
+	// budget is the number of additional value-pair comparisons permitted
+	// when running a budgeted comparison. A negative value means that no
+	// budget is in effect (the default behavior of Equal and Diff).
+	// used counts the number of value-pair comparisons charged to the
+	// primary traversal. Value pairs already visited as part of a
+	// reference cycle are not charged.
+	// incomplete is set once the budget is exhausted and remains set for
+	// the remainder of the comparison.
+	// speculating is set while statelessCompare performs auxiliary
+	// comparisons (e.g., detecting ignored slice elements). Such work
+	// consumes the shared budget, but is not charged to the primary
+	// traversal and does not mutate its result.
+	budget      int
+	used        int
+	incomplete  bool
+	speculating bool
+
 	// recChecker checks for infinite cycles applying the same set of
 	// transformers upon the output of itself.
 	recChecker recChecker
@@ -187,7 +204,7 @@ type state struct {
 
 func newState(opts []Option) *state {
 	// Always ensure a validator option exists to validate the inputs.
-	s := &state{opts: Options{validator{}}}
+	s := &state{opts: Options{validator{}}, budget: -1}
 	s.curPtrs.Init()
 	s.processOption(Options(opts))
 	return s
@@ -227,12 +244,42 @@ func (s *state) statelessCompare(step PathStep) diff.Result {
 	// when calling this function to when returning from it.
 
 	oldResult, oldReporters := s.result, s.reporters
+	oldUsed, oldSpeculating := s.used, s.speculating
 	s.result = diff.Result{} // Reset result
 	s.reporters = nil        // Remove reporters to avoid spurious printouts
+	s.used = 0               // Auxiliary work is not charged to the primary traversal
+	s.speculating = true
 	s.compareAny(step)
 	res := s.result
 	s.result, s.reporters = oldResult, oldReporters
+	s.used, s.speculating = oldUsed, oldSpeculating
 	return res
+}
+
+// charge records entry into a real comparison of a value pair and reports
+// whether the comparison is permitted to proceed. In a budgeted comparison,
+// each entry consumes one unit of the shared work budget. Comparisons
+// performed by statelessCompare share the budget, but are not charged to
+// the count returned for the primary traversal.
+//
+// A value pair already visited as part of a reference cycle is never
+// charged: pointer, slice-element, and map cycle checks run before charge.
+func (s *state) charge() bool {
+	if s.budget < 0 {
+		if !s.speculating {
+			s.used++
+		}
+		return true
+	}
+	if s.budget == 0 {
+		s.incomplete = true
+		return false
+	}
+	s.budget--
+	if !s.speculating {
+		s.used++
+	}
+	return true
 }
 
 func (s *state) compareAny(step PathStep) {
@@ -255,6 +302,24 @@ func (s *state) compareAny(step PathStep) {
 			return
 		}
 		defer s.curPtrs.Pop(px, py)
+	}
+
+	// Cycle-detection for pointers and maps is performed before charging so
+	// that revisiting a value pair on the current path (a reference cycle)
+	// is not counted as a new comparison.
+	if (t.Kind() == reflect.Ptr || t.Kind() == reflect.Map) && vx.IsValid() && vy.IsValid() && !vx.IsNil() && !vy.IsNil() {
+		if eq, visited := s.curPtrs.Push(vx, vy); visited {
+			s.report(eq, reportByCycle)
+			return
+		}
+		defer s.curPtrs.Pop(vx, vy)
+	}
+
+	// Entering a real comparison of a value pair costs one unit of the
+	// work budget. When the budget is exhausted, the traversal stops here
+	// before any option, Equal method, or default comparison runs.
+	if !s.charge() {
+		return
 	}
 
 	// Rule 1: Check whether an option applies on this node in the value tree.
@@ -379,6 +444,9 @@ func (s *state) compareStruct(t reflect.Type, vx, vy reflect.Value) {
 	var mayForce, mayForceInit bool
 	step := StructField{&structField{}}
 	for i := 0; i < t.NumField(); i++ {
+		if s.incomplete {
+			return
+		}
 		step.typ = t.Field(i).Type
 		step.vx = vx.Field(i)
 		step.vy = vy.Field(i)
@@ -461,6 +529,9 @@ func (s *state) compareSlice(t reflect.Type, vx, vy reflect.Value) {
 	var indexesX, indexesY []int
 	var ignoredX, ignoredY []bool
 	for ix := 0; ix < vx.Len(); ix++ {
+		if s.incomplete {
+			break
+		}
 		ignored := s.statelessCompare(withIndexes(ix, -1)).NumDiff == 0
 		if !ignored {
 			indexesX = append(indexesX, ix)
@@ -468,6 +539,9 @@ func (s *state) compareSlice(t reflect.Type, vx, vy reflect.Value) {
 		ignoredX = append(ignoredX, ignored)
 	}
 	for iy := 0; iy < vy.Len(); iy++ {
+		if s.incomplete {
+			break
+		}
 		ignored := s.statelessCompare(withIndexes(-1, iy)).NumDiff == 0
 		if !ignored {
 			indexesY = append(indexesY, iy)
@@ -476,13 +550,22 @@ func (s *state) compareSlice(t reflect.Type, vx, vy reflect.Value) {
 	}
 
 	// Compute an edit-script for slices vx and vy (excluding ignored elements).
-	edits := diff.Difference(len(indexesX), len(indexesY), func(ix, iy int) diff.Result {
-		return s.statelessCompare(withIndexes(indexesX[ix], indexesY[iy]))
-	})
+	var edits diff.EditScript
+	if !s.incomplete {
+		edits = diff.Difference(len(indexesX), len(indexesY), func(ix, iy int) diff.Result {
+			if s.incomplete {
+				return diff.BoolResult(true)
+			}
+			return s.statelessCompare(withIndexes(indexesX[ix], indexesY[iy]))
+		})
+	}
 
 	// Replay the ignore-scripts and the edit-script.
 	var ix, iy int
 	for ix < vx.Len() || iy < vy.Len() {
+		if s.incomplete {
+			return
+		}
 		var e diff.EditType
 		switch {
 		case ix < len(ignoredX) && ignoredX[ix]:
@@ -513,17 +596,13 @@ func (s *state) compareMap(t reflect.Type, vx, vy reflect.Value) {
 		return
 	}
 
-	// Cycle-detection for maps.
-	if eq, visited := s.curPtrs.Push(vx, vy); visited {
-		s.report(eq, reportByCycle)
-		return
-	}
-	defer s.curPtrs.Pop(vx, vy)
-
 	// We combine and sort the two map keys so that we can perform the
 	// comparisons in a deterministic order.
 	step := MapIndex{&mapIndex{pathStep: pathStep{typ: t.Elem()}}}
 	for _, k := range value.SortKeys(append(vx.MapKeys(), vy.MapKeys()...)) {
+		if s.incomplete {
+			return
+		}
 		step.vx = vx.MapIndex(k)
 		step.vy = vy.MapIndex(k)
 		step.key = k
@@ -554,13 +633,6 @@ func (s *state) comparePtr(t reflect.Type, vx, vy reflect.Value) {
 		s.report(vx.IsNil() && vy.IsNil(), 0)
 		return
 	}
-
-	// Cycle-detection for pointers.
-	if eq, visited := s.curPtrs.Push(vx, vy); visited {
-		s.report(eq, reportByCycle)
-		return
-	}
-	defer s.curPtrs.Pop(vx, vy)
 
 	vx, vy = vx.Elem(), vy.Elem()
 	s.compareAny(Indirect{&indirect{pathStep{t.Elem(), vx, vy}}})
