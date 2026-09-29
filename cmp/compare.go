@@ -172,6 +172,12 @@ type state struct {
 	curPtrs   pointerPath // The current set of visited pointers
 	reporters []reporter  // Optional reporters
 
+	// budget is the remaining number of value pairs that may still be
+	// entered for comparison. A negative value means unlimited.
+	// incomplete is set once a non-negative budget reaches zero.
+	budget     int
+	incomplete bool
+
 	// recChecker checks for infinite cycles applying the same set of
 	// transformers upon the output of itself.
 	recChecker recChecker
@@ -187,7 +193,7 @@ type state struct {
 
 func newState(opts []Option) *state {
 	// Always ensure a validator option exists to validate the inputs.
-	s := &state{opts: Options{validator{}}}
+	s := &state{opts: Options{validator{}}, budget: -1}
 	s.curPtrs.Init()
 	s.processOption(Options(opts))
 	return s
@@ -245,16 +251,38 @@ func (s *state) compareAny(step PathStep) {
 	}
 	s.recChecker.Check(s.curPath)
 
-	// Cycle-detection for slice elements (see NOTE in compareSlice).
+	// Cycle-detection before charging the work budget.
+	//
+	// Slice elements are always handled here (see NOTE in compareSlice).
+	// In a budgeted comparison, maps and pointers are also handled here so
+	// that revisiting an already-seen value pair is recognized as a cycle
+	// and does not consume the budget.
 	t := step.Type()
 	vx, vy := step.Values()
+	var px, py reflect.Value
 	if si, ok := step.(SliceIndex); ok && si.isSlice && vx.IsValid() && vy.IsValid() {
-		px, py := vx.Addr(), vy.Addr()
+		px, py = vx.Addr(), vy.Addr()
+	} else if s.budget >= 0 && (t.Kind() == reflect.Ptr || t.Kind() == reflect.Map) && vx.IsValid() && vy.IsValid() && !vx.IsNil() && !vy.IsNil() {
+		px, py = vx, vy
+	}
+	if px.IsValid() {
 		if eq, visited := s.curPtrs.Push(px, py); visited {
 			s.report(eq, reportByCycle)
 			return
 		}
 		defer s.curPtrs.Pop(px, py)
+	}
+
+	// Entering a real value-pair comparison consumes one unit of the work
+	// budget. Cycle revisits were handled above and are not charged.
+	// Once the budget reaches zero, no further options, methods, or user
+	// callbacks are evaluated.
+	if s.budget >= 0 {
+		if s.budget == 0 {
+			s.incomplete = true
+			return
+		}
+		s.budget--
 	}
 
 	// Rule 1: Check whether an option applies on this node in the value tree.
@@ -513,12 +541,15 @@ func (s *state) compareMap(t reflect.Type, vx, vy reflect.Value) {
 		return
 	}
 
-	// Cycle-detection for maps.
-	if eq, visited := s.curPtrs.Push(vx, vy); visited {
-		s.report(eq, reportByCycle)
-		return
+	// Cycle-detection for maps. In a budgeted comparison this was already
+	// done in compareAny before the budget was charged.
+	if s.budget < 0 {
+		if eq, visited := s.curPtrs.Push(vx, vy); visited {
+			s.report(eq, reportByCycle)
+			return
+		}
+		defer s.curPtrs.Pop(vx, vy)
 	}
-	defer s.curPtrs.Pop(vx, vy)
 
 	// We combine and sort the two map keys so that we can perform the
 	// comparisons in a deterministic order.
@@ -555,12 +586,15 @@ func (s *state) comparePtr(t reflect.Type, vx, vy reflect.Value) {
 		return
 	}
 
-	// Cycle-detection for pointers.
-	if eq, visited := s.curPtrs.Push(vx, vy); visited {
-		s.report(eq, reportByCycle)
-		return
+	// Cycle-detection for pointers. In a budgeted comparison this was
+	// already done in compareAny before the budget was charged.
+	if s.budget < 0 {
+		if eq, visited := s.curPtrs.Push(vx, vy); visited {
+			s.report(eq, reportByCycle)
+			return
+		}
+		defer s.curPtrs.Pop(vx, vy)
 	}
-	defer s.curPtrs.Pop(vx, vy)
 
 	vx, vy = vx.Elem(), vy.Elem()
 	s.compareAny(Indirect{&indirect{pathStep{t.Elem(), vx, vy}}})
